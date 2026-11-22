@@ -145,7 +145,7 @@ train:
   adam_eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
-  precision: bf16
+  precision: bf16         # fp32 is accepted as a CPU/test fallback only; it is not a training setting
   pass_sampling: fixed    # fixed | uniform (ablation: T ~ U{1..n_passes} per micro-batch)
   curriculum:             # fractions of total_tokens; see §6.5
     - {until: 0.82, max_len: 8192,   long_doc_frac: 0.15}
@@ -403,7 +403,7 @@ loss    = L_CE + lb_coef · Σ_layers L_LB + z_coef · Σ_layers L_Z
 
 - Form and coefficients are Switch/OLMoE **[S]** (https://arxiv.org/abs/2101.03961; OLMoE §4.1.6-7: 0.01 and 0.001; without the balance loss OLMoE's first layer collapsed onto one expert).
 - The smoothed load `f̃` is **[J]**, motivated by Qiu et al.: when a micro-batch is close to one sequence, the standard loss forces uniform routing within that sequence and suppresses specialisation (https://arxiv.org/abs/2501.11873). At 262k a micro-batch is one document. ρ = 0 recovers the standard loss. The buffer `f̃` is written exactly once per training-mode forward of a micro-batch (never by a checkpoint recomputation); in eval mode the loss is computed from the same formula but the buffer is left untouched, so evaluation never changes training state.
-- `balance: bias` (ablation, DeepSeek-V3/V4.1 **[D]**; https://arxiv.org/abs/2412.19437 §2.1.2): a non-learned buffer `c ∈ R^E` per layer is added to `logits` for the top-k selection only; after each optimiser step `c_i += bias_update_speed · sign(1/E − f_step[i])`; `lb_coef` is set to 1e-4.
+- `balance: bias` (ablation, DeepSeek-V3/V4.1 **[D]**; https://arxiv.org/abs/2412.19437 §2.1.2): a non-learned buffer `c ∈ R^E` per layer is added to `logits` for the top-k selection only; after each optimiser step `c_i += bias_update_speed · sign(1/E − f_step[i])`. The config of such a run must set `lb_coef: 1e-4` itself; the trainer warns if it finds another value and does not override it.
 
 Dead experts: an expert is dead if its load over an evaluation window is below 0.1/E. No revival mechanism is built. With 8 of 28 selected, death is unlikely; if any expert stays dead for 2,000 steps after warm-up, the run is restarted with `lb_coef: 0.03`, and if that fails with `balance: bias`.
 
@@ -520,7 +520,7 @@ These are estimates (±30%); acceptance test T16 replaces them with measurements
 
 ### 6.5 Length curriculum
 
-One optimiser schedule; stages switch by tokens consumed. A step is always 262,144 tokens, accumulated over micro-batches of at most `mb_tokens`.
+One optimiser schedule; stages switch by tokens consumed. A step draws whole sequences until its token count reaches or exceeds `tokens_per_step`; the last sequence may overshoot, nothing is carried to the next step, so every step holds at least 262,144 and fewer than 262,144 + `max_len` tokens. (Carrying an overflowing sequence forward instead leaves stage-3 steps about 15% under-filled on average and occasionally almost empty.) The step's sequences are packed into micro-batches of at most `mb_tokens`; a sequence longer than `mb_tokens` forms a micro-batch of its own, so `mb_tokens` is a packing budget and memory must be sized for `max_len` (§6.4). Tokens are the clock: the run ends at the first step boundary where `total_tokens` have been consumed, and the stage and the learning rate of a step are functions of the tokens consumed before it (§9).
 
 | Stage | Token share | `max_len` | Long-document share of tokens | Approx. share of compute |
 |---|---|---|---|---|
@@ -573,7 +573,7 @@ Tokens needed (default `total_tokens: 6e9`):
 - Lower bound from the usual ~20 tokens per parameter for dense models (https://arxiv.org/abs/2203.15556) applied to the body: 4B.
 - Expert weights are 119M inactive plus 48M active of the 198M; each expert sees 8/28 of the token-applications of its layer. Giving experts the same number of updates per parameter as a dense layer pushes the figure towards 6-10B.
 - 6B is about 4.6B FineWeb-Edu tokens plus 1.4B book tokens (under one epoch of each). With checkpointing and the assumed rates of §6.3 it is about 2.0e19 FLOPs: roughly 22 hours on an H100-class card or 3.3 days on a 24 GB card. Tiers: smoke 50M, ablation 600M, full 6B.
-- Losses are reported in bits per byte as well as nats per token, because the 200k tokenizer makes per-token loss incomparable with published small-model numbers.
+- Losses are reported in bits per byte as well as nats per token, because the 200k tokenizer makes per-token loss incomparable with published small-model numbers. The byte count of a crop is its document's byte count scaled by the crop's share of the document's tokens.
 
 ---
 
@@ -583,11 +583,12 @@ Tokens needed (default `total_tokens: 6e9`):
 |---|---|---|
 | Optimiser | AdamW, β = (0.9, 0.95), eps 1e-8 | [S] |
 | Peak LR | 4e-4 (sweep 2e-4 / 4e-4 / 8e-4 in the smoke tier) | [S] range: OLMoE 4e-4, Moonlight 4.2e-4, DeepSeek-V4.1 2.6e-4, MoEUT 2.5e-4 |
-| Schedule | linear warm-up 1,000 steps, cosine to 0.1x peak at the last step | [S] |
-| Step size | 262,144 tokens (22,888 steps for 6B) | [J] |
+| Schedule | `lr = min(1, (step+1)/warmup_steps) · [lo + ½(peak − lo)(1 + cos(π·p))]`, `lo = lr_min_ratio·peak`, `p = min(1, tokens consumed before the step / total_tokens)`, `step` 0-based | [S] |
+| Step size | at least 262,144 tokens (§6.5). `floor(total_tokens / tokens_per_step)` = 22,888 for 6B and 190 for the smoke tier is the nominal step count, used for planning only; the actual count is slightly lower because steps overshoot | [J] |
 | Weight decay 0.1 | all matrices: `Emb`, attention, experts, router weight, output-gate weight | [S] |
 | Weight decay 0 | RMSNorm gains, biases, QK scales, depth queries, cross-pass `u`, `P`, `F`, `G` | [J]: decay on F and G pulls the loop shut |
 | Gradient clipping | global norm 1.0 | [S] |
+| Loss over a step | cross-entropy is summed over the step's micro-batches and divided by the step's total target count; each micro-batch's auxiliary loss is weighted by its share of the step's tokens | [S] |
 | Precision | bf16 autocast; float32 for `nrm`, DepthMix softmax, router and auxiliary losses, softcap and cross-entropy | [S] |
 | Dropout | none | [S] |
 | Checkpointing | `grad_ckpt: layer` | §6.4 |
@@ -595,7 +596,7 @@ Tokens needed (default `total_tokens: 6e9`):
 
 The shared core weights accumulate gradient from three passes; no per-pass rescaling is applied (Adam normalises it).
 
-Muon (ablation 6, not the default because its interaction with zero-initialised readers and gates is untested): for attention and expert matrices only, per expert slice; Nesterov momentum 0.95; five Newton-Schulz steps with (3.4445, −4.7750, 2.0315); update = 0.2·sqrt(max(rows, cols))·NS(·) so the AdamW learning rate and weight decay 0.1 carry over; everything else stays on AdamW (https://arxiv.org/abs/2502.16982, eqs. 1-4; about 2x compute efficiency over AdamW claimed, and the paper's own model is an MoE; DeepSeek-V4.1 uses the same split with RMS 0.18 [D]).
+Muon (ablation 6, not the default because its interaction with zero-initialised readers and gates is untested): for the attention matrices `W_Q`, `W_K`, `W_V`, `W_O`, the expert matrices (per expert slice) and, in the dense baselines, the dense-FFN `W_in` and `W_out`; the embedding, router weight, output-gate weight, cross-pass `P`, `F`, `G` and all vectors stay on AdamW; Nesterov momentum 0.95; five Newton-Schulz steps with (3.4445, −4.7750, 2.0315); update = 0.2·sqrt(max(rows, cols))·NS(·) so the AdamW learning rate and weight decay 0.1 carry over; everything else stays on AdamW (https://arxiv.org/abs/2502.16982, eqs. 1-4; about 2x compute efficiency over AdamW claimed, and the paper's own model is an MoE; DeepSeek-V4.1 uses the same split with RMS 0.18 [D]).
 
 Throughput notes:
 
@@ -615,8 +616,8 @@ MoE is working if:
 |---|---|---|
 | Load entropy | H(f)/ln E per stored layer, and per pass for core layers | > 0.95 |
 | Max/min load ratio | per layer | < 4 |
-| Dead experts | load < 0.1/E over the eval window | 0 |
-| Router confidence | mean of the largest of the 8 gate weights / 8 | rises from 0.125, stays < 0.6 |
+| Dead experts | load < 0.1/E over the window: the log interval (100 steps) during training, the fixed held-out batches at eval | 0 |
+| Router confidence | mean of the largest gate weight divided by `route_scale` | rises from 0.125, stays < 0.6 |
 | Pass overlap (eval) | mean Jaccard overlap of a token's expert sets between passes, per core layer | below 1; equal to 1 means passes route identically |
 | `L_LB`, `L_Z` | per layer | `L_LB` near 1.0 |
 | Value of experts | rex-v2 vs B1 loss at equal tokens | clear gap |
@@ -644,9 +645,9 @@ Long context is working if:
 | Metric | Definition |
 |---|---|
 | Loss by position bucket (eval, PG-19) | 0-1k, 1k-8k, 8k-64k, 64k-262k; must not rise with position |
-| Context truncation (eval) | loss on the same target tokens given the last 1k / 8k / 64k / all context; the difference is the value of long context |
+| Context truncation (eval) | loss on the same target tokens given the last 1k / 8k / 64k / all context, each truncated input starting with `bos_id` as in training; the difference is the value of long context |
 | Repeat probe (eval) | a held-out passage of 512 tokens repeated after a gap of 2k / 16k / 128k unrelated tokens; loss on the repeat should be far below loss on first occurrence |
-| Attention distance (eval, reference backend, short sequences) | share of full-layer attention mass beyond 1,024 tokens |
+| Attention distance (eval, reference backend, short sequences) | share of full-layer attention mass on keys at least `window` tokens back, averaged over the queries that have such keys |
 
 Optimisation and system: training and validation loss in nats and bits per byte, gradient norm and clip fraction, update-to-weight ratio per parameter group, share of logits beyond ±25 (softcap saturation), QK scales, output-gate means, tokens/s, peak memory, sequence-length histogram per stage.
 
@@ -675,7 +676,7 @@ Every comparison is reported twice: at equal training tokens and at equal traini
 
 ## 12. Ablation plan (ordered)
 
-Each run uses the 600M-token tier (2,289 steps) with stage-1 settings and `warmup_steps: 200` unless stated; run 0 uses `smoke.yaml` (§13). An MoE's advantage can appear late because experts train on a fraction of tokens, so any conclusion that decides the final architecture is re-checked at 6B.
+Each run uses the 600M-token tier (nominally 2,289 steps) with stage-1 settings and `warmup_steps: 200` unless stated; run 0 uses `smoke.yaml` (§13). An MoE's advantage can appear late because experts train on a fraction of tokens, so any conclusion that decides the final architecture is re-checked at 6B.
 
 | # | Question | Runs |
 |---|---|---|
@@ -699,7 +700,8 @@ Each run uses the 600M-token tier (2,289 steps) with stage-1 settings and `warmu
 rex-v2/
   docs/DESIGN.md
   configs/            rex-v2-base.yaml, a1.yaml, b0.yaml, b1.yaml, b2.yaml, b3.yaml, smoke.yaml
-                      # smoke.yaml = base model; train.total_tokens: 5.0e7 (190 steps); train.warmup_steps: 20;
+                      # tiny-cpu.yaml = CPU harness on a stand-in tokenizer; exercises the code path only, not a tier
+                      # smoke.yaml = base model; train.total_tokens: 5.0e7 (nominally 190 steps); train.warmup_steps: 20;
                       # train.curriculum: [{until: 1.00, max_len: 8192, long_doc_frac: 0.15}]
   rex/
     config.py         dataclasses, validation (e.g. stream requires n_passes == 1)
@@ -743,7 +745,7 @@ Tolerances: 1e-5 relative in float64 on the reference backend unless stated. "Ti
 | T3 | Loop identity at init | with default init, logits for T = 1, 2, 3 are equal, and V2[t], V3[t] are equal for all t |
 | T4 | Loop is live | after setting F, G to random values, logits for T = 1 and T = 3 differ; with γ forced to 0 and κ to 1 they are equal again |
 | T5 | DepthMix | with q = 0 the weights are exactly 1/n; weights sum to 1; output is unchanged when any source is multiplied by a positive scalar |
-| T6 | Block-scale invariance | tiny model at default init, float64, with `rms_eps: 1e-12` for this test only: multiplying all `W_O` and expert `W_out` of one block by 3.0 leaves logits unchanged within 1e-8, for a prelude, a core and the coda block. No weight rescaling in the test. The base config at default eps is not asserted (see §5.3) |
+| T6 | Block-scale invariance | tiny model at default init, float64, with `rms_eps: 1e-12` for this test only: multiplying all `W_O` and expert `W_out` of one block by 3.0 leaves logits unchanged within 1e-8, for a prelude, a core and the coda block. The logits compared are the §5.8 head applied in float64 to `hfinal` inside the test, because the model's own logits are float32. No weight rescaling in the test. The base config at default eps is not asserted and has no T6 test (see §5.3) |
 | T7 | Source lists | a hook records the sources of every reader in every pass; they equal the table in §5.3; reader count is 56 for the base config |
 | T8 | Causality | changing token j changes no logit at positions < j, for every pass |
 | T9 | Window | in a single windowed attention module, the output at i is unchanged by tokens at positions ≤ i − window |
@@ -759,9 +761,11 @@ Tolerances: 1e-5 relative in float64 on the reference backend unless stated. "Ti
 | T19 | Gradient reach | after 2 optimiser steps on the tiny model every parameter except padded embedding rows has a non-zero gradient (at step 0 only `P` and `u` may be zero) |
 | T20 | Overfit | tiny model reaches cross-entropy `L_CE` < 0.05 on one fixed batch of 4 sequences x 64 tokens within 500 steps, optimising the full loss with auxiliary losses on. The threshold is on `L_CE` alone: the auxiliary term has a floor of about `lb_coef` x (number of MoE layers), 0.08 in the tiny model and 0.24 in the base model |
 | T21 | Incremental decoding | token-by-token generation with per-application caches reproduces the full-sequence logits |
-| T22 | Baselines | B0 with `residual: stream` runs T8 and T20, and T2 with two bands: `L_CE` within [12.1, 13.0] as is, and within [12.1, 12.6] when each position's logit for its own input token id is excluded from the softmax (§11 explains the difference); config validation rejects stream with `n_passes` > 1 |
+| T22 | Baselines | B0 with `residual: stream` runs T8 and T20, and T2 with two bands: `L_CE` within [12.1, 13.0] as is, and within [12.1, 12.6] when each position's logit for its own input token id is excluded from the softmax, over the positions whose target differs from the input token (§11 explains the difference); config validation rejects stream with `n_passes` > 1 |
 | T23 | Long sequence (GPU) | one forward and backward at the stage-3 `max_len` completes within memory on the target card, and the flash backend accepts that length |
-| T24 | Curriculum loader | every sequence starts with `bos_id`, never exceeds the stage `max_len`, `eot_id` only at true document ends, token budget per step within one sequence of 262,144 |
+| T24 | Curriculum loader | every sequence starts with `bos_id`, never exceeds the stage `max_len`, `eot_id` only at true document ends; every step holds at least `tokens_per_step` tokens and fewer than `tokens_per_step` + `max_len`; no sequence is split across micro-batches; a run consumes at least `total_tokens` and less than `total_tokens` + `tokens_per_step` + `max_len`; the schedule of §9 returns `lr_min_ratio`·peak at p = 1 and peak·(step+1)/`warmup_steps` at p = 0 during warm-up |
+
+GPU pre-flight. As of the stage-2 commit the suite runs on CPU only, with a stand-in 500-id tokenizer. Not yet exercised anywhere: the Inkling tokenizer file, the dataset presets and `prep.py` on real data, the flash backend (T11), bf16, measured memory (T16), and a full-length forward and backward (T23). Before any run beyond `smoke.yaml`, on the target GPU: (1) download and hash-pin the tokenizer with an authenticated Hugging Face token (anonymous download returned HTTP 429) and run the tokenizer test; (2) run the four skipped tests; (3) prep a small sample of both corpora and record tokens per document and per byte; (4) run `smoke.yaml` and replace the assumed throughput of §6.3 with the measured one.
 
 ---
 
