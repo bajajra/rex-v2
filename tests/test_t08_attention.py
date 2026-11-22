@@ -23,9 +23,15 @@ def _forward_all(model, ids, cu, pos, T):
 
 
 # ---------------------------------------------------------------- T8
+# Exact (torch.equal) comparison is run under ffn.dispatch: dense_ref, whose per-token
+# arithmetic does not depend on other tokens. Under sorted dispatch, changing token j changes
+# the per-expert slice sizes and hence BLAS blocking, which can move other rows by ~1e-12
+# without any information flow; sorted == dense_ref is checked with a tolerance in T14
+# (test_t13_moe.py) and by test_t8_causality_sorted_dispatch below.
+@pytest.mark.parametrize("train", [False, True])
 @pytest.mark.parametrize("j", [0, 5, 17, 29])
-def test_t8_causality(j):
-    model = make_tiny(randomize=True).eval()
+def test_t8_causality(j, train):
+    model = make_tiny(randomize=True, model={"ffn": {"dispatch": "dense_ref"}}).train(train)
     ids, cu, pos = packed([30])
     ids2 = ids.clone()
     ids2[j] = (ids[j] + 1) % 500
@@ -36,6 +42,20 @@ def test_t8_causality(j):
         for key in ba:  # block sums of every pass
             assert torch.equal(ba[key][:j], bb[key][:j]), key
         assert (a[j:] - b[j:]).abs().max() > 0  # the change is visible from j on
+
+
+@pytest.mark.parametrize("j", [0, 11, 29])
+def test_t8_causality_sorted_dispatch(j):
+    model = make_tiny(randomize=True).eval()
+    ids, cu, pos = packed([30])
+    ids2 = ids.clone()
+    ids2[j] = (ids[j] + 1) % 500
+    for T in (1, 2, 3):
+        a, ba = _forward_all(model, ids, cu, pos, T)
+        b, bb = _forward_all(model, ids2, cu, pos, T)
+        torch.testing.assert_close(a[:j], b[:j], rtol=0, atol=1e-9)
+        for key in ba:
+            torch.testing.assert_close(ba[key][:j], bb[key][:j], rtol=0, atol=1e-9)
 
 
 # ---------------------------------------------------------------- T9
