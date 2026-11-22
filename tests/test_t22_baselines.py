@@ -8,7 +8,7 @@ import torch
 
 from conftest import CONFIGS, make_tiny, packed
 from rex.config import RexConfig, load_config, tiny_config
-from rex.model import RexModel, lm_loss
+from rex.model import RexModel, lm_loss, next_token_targets
 
 STREAM = {"model": {"residual": "stream", "n_passes": 1, "ffn": {"type": "dense"}}}
 
@@ -86,7 +86,16 @@ def test_t22_b0_initial_loss():
     model = RexModel(cfg).eval()
     ids, cu, pos = packed([256, 192], vocab=cfg.model.unpadded_vocab_size, seed=1)
     with torch.no_grad():
-        ce, _ = lm_loss(model, ids, cu, pos)
+        out = model(ids, cu, pos)
+        logits = model.logits(out.hidden)
     del model
     gc.collect()
-    assert 12.1 <= ce.item() <= 12.6, ce.item()
+    tgt = next_token_targets(ids, cu)
+    ce = torch.nn.functional.cross_entropy(logits, tgt, ignore_index=-100)
+    # §14 T22 / §11: as is within [12.1, 13.0]; with each position's logit for its own input
+    # token id excluded from the softmax within [12.1, 12.6].
+    assert 12.1 <= ce.item() <= 13.0, ce.item()
+    masked = logits.scatter(1, ids[:, None], float("-inf"))
+    keep = tgt != ids  # a target equal to the input token would have its own logit removed
+    ce_ex = torch.nn.functional.cross_entropy(masked[keep], tgt[keep], ignore_index=-100)
+    assert 12.1 <= ce_ex.item() <= 12.6, ce_ex.item()

@@ -116,10 +116,10 @@ def active_counts(cfg: RexConfig) -> Dict[str, int]:
     """§1/§3 active-parameter accounting.
 
     stored_active = body - L·(E-k)·3·d·h (inactive experts).
-    effective_active counts each layer application (L + (T-1)·C of them): attention matrices,
-    output-gate weight, router weight and bias, the k active experts (or the dense FFN), plus
-    P, F, G of every gated application. This definition is inferred: it is the one that
-    reproduces §1's 156,654,912 (it includes the router bias but not the output-gate bias).
+    effective_active (§3): weight matrices only, each counted once per layer application
+    (L + (T-1)·C of them): attention matrices, output-gate weight, router weight, the k active
+    experts (or the dense FFN), plus P, F, G of every gated application. All vectors (biases,
+    gains, QK scales, queries) are excluded.
     """
     m, a, f = cfg.model, cfg.model.attn, cfg.model.ffn
     c = analytic_counts(cfg)
@@ -128,7 +128,7 @@ def active_counts(cfg: RexConfig) -> Dict[str, int]:
     moe = f.type == "moe"
     if moe:
         inactive = L * (f.n_experts - f.top_k) * 3 * d * f.expert_hidden
-        ffn_app = f.n_experts * d + (f.n_experts if f.router_bias else 0) + f.top_k * 3 * d * f.expert_hidden
+        ffn_app = f.n_experts * d + f.top_k * 3 * d * f.expert_hidden
     else:
         inactive = 0
         ffn_app = 3 * d * f.dense_hidden

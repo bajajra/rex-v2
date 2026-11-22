@@ -10,7 +10,7 @@ import torch
 from conftest import packed
 from rex.config import RexConfig
 from rex.model import RexModel, lm_loss
-from test_t05_attnres import check_sources, scale_block
+from test_t05_attnres import check_sources
 
 
 @pytest.fixture(scope="module")
@@ -43,20 +43,3 @@ def test_t7_base_sources_and_reader_count(base_model):
     readers = check_sources(base_model.cfg, events, T=3)
     assert len(readers) == 56
 
-
-@pytest.mark.slow
-def test_t6_base_block_scale_invariance(base_model):
-    """T6 on the base config at default init (float32, tolerance 1e-4)."""
-    ids, cu, pos = packed([24, 16], vocab=base_model.mcfg.unpadded_vocab_size, seed=3)
-    with torch.no_grad():
-        ref = base_model.logits(base_model(ids, cu, pos).hidden)
-        bs = base_model.bs
-        for b in range(4):
-            saved = [(base_model.layers[l].attn.wo.weight.clone(), base_model.layers[l].ffn.w_out.clone())
-                     for l in range(b * bs, (b + 1) * bs)]
-            scale_block(base_model, b, 3.0)
-            out = base_model.logits(base_model(ids, cu, pos).hidden)
-            for l, (wo, wout) in zip(range(b * bs, (b + 1) * bs), saved):
-                base_model.layers[l].attn.wo.weight.copy_(wo)
-                base_model.layers[l].ffn.w_out.copy_(wout)
-            torch.testing.assert_close(out, ref, rtol=0, atol=1e-4)

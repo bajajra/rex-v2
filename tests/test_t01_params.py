@@ -81,7 +81,7 @@ def test_derived_counts():
     cfg = RexConfig()
     a = active_counts(cfg)
     assert a["stored_active"] == 78_416_448
-    assert a["effective_active"] == 156_654_912
+    assert a["effective_active"] == 156_653_568
     assert a["layer_applications"] == 48
     untied = cfg.replace(model={"tie_embeddings": False})
     c = analytic_counts(untied)

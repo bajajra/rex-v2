@@ -37,20 +37,8 @@ def test_t5_weights_sum_to_one_and_scale_invariance():
 
 
 # ---------------------------------------------------------------- T6
-# The invariance is exact only up to the RMSNorm eps: nrm(3x) != nrm(x) when mean(x^2) is not
-# >> eps, and an eps-sized change can flip a top-k routing decision. In the tiny model at the
-# std-0.02 init the block sums have RMS ~0.025, which is not enough. So the tiny test boosts
-# the value/output/expert matrices x5 (block-sum RMS ~O(0.1-1)); the base config is tested
-# at its default init in test_t02_full_model.py.
-def _boosted_tiny():
-    m = make_tiny(dtype=torch.float32).eval()
-    with torch.no_grad():
-        for L in m.layers:
-            for w in (L.attn.wv.weight, L.attn.wo.weight, L.ffn.w_in, L.ffn.w_out):
-                w.mul_(5.0)
-    return m
-
-
+# §14 T6: tiny model at default init, float64, rms_eps 1e-12 for this test only (the
+# invariance is exact only as eps -> 0, §5.3), tolerance 1e-8, no weight rescaling.
 def scale_block(model, b, factor):
     bs = model.bs
     with torch.no_grad():
@@ -60,17 +48,27 @@ def scale_block(model, b, factor):
             (w_out if isinstance(w_out, torch.Tensor) else w_out.weight).mul_(factor)
 
 
+def _logits64(model, hidden):
+    # model.logits() returns float32 by §5.8, whose ulp (~6e-8) exceeds the 1e-8 tolerance;
+    # the same softcapped head is evaluated here in float64.
+    w = model.output_weight()[: model.mcfg.unpadded_vocab_size]
+    c = model.mcfg.final_logit_softcap
+    return c * torch.tanh(torch.nn.functional.linear(hidden, w) / c)
+
+
 def test_t6_block_scale_invariance(tiny_batch):
     ids, cu, pos = tiny_batch
-    base = _boosted_tiny()
+    eps = {"model": {"rms_eps": 1e-12}}
+    base = make_tiny(dtype=torch.float64, **eps).eval()
     with torch.no_grad():
-        ref = base.logits(base(ids, cu, pos).hidden)
-    for b in range(4):
-        m = _boosted_tiny()
+        ref = _logits64(base, base(ids, cu, pos).hidden)
+    for b in range(4):  # prelude, both core blocks, coda
+        m = make_tiny(dtype=torch.float64, **eps).eval()
         scale_block(m, b, 3.0)
         with torch.no_grad():
-            out = m.logits(m(ids, cu, pos).hidden)
-        torch.testing.assert_close(out, ref, rtol=0, atol=1e-4)
+            out = _logits64(m, m(ids, cu, pos).hidden)
+        assert out.dtype == torch.float64
+        torch.testing.assert_close(out, ref, rtol=0, atol=1e-8)
 
 
 # ---------------------------------------------------------------- T7
