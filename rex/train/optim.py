@@ -4,8 +4,9 @@ Weight decay 0.1: all matrices — ``Emb`` (and an untied output head), attentio
 experts W_in/W_out, router weight, output-gate weight (and the dense-FFN matrices of the
 baselines). Weight decay 0: RMSNorm gains, biases, QK scales, depth queries, cross-pass u, P, F, G.
 
-Muon (ablation, ``optimizer: muon``): attention W_Q/W_K/W_V/W_O and expert W_in/W_out only, per
-expert slice; Nesterov momentum 0.95; five Newton-Schulz steps with (3.4445, -4.7750, 2.0315);
+Muon (ablation, ``optimizer: muon``): attention W_Q/W_K/W_V/W_O, expert W_in/W_out (per expert
+slice) and, in the dense baselines, dense-FFN W_in/W_out; embedding, router weight, output-gate
+weight, cross-pass P/F/G and all vectors stay on AdamW; Nesterov momentum 0.95; five Newton-Schulz steps with (3.4445, -4.7750, 2.0315);
 update = 0.2·sqrt(max(rows, cols))·NS(·), with the AdamW learning rate and weight decay 0.1.
 Everything else stays on AdamW.
 """
@@ -28,9 +29,7 @@ _RULES: List[Tuple[str, str]] = [
     (r"^layers\.\d+\.attn\.gate\.bias$", "no_decay"),
     (r"^layers\.\d+\.attn\.qk_scale$", "no_decay"),
     (r"^layers\.\d+\.ffn\.w_(in|out)$", "decay_matrix"),             # MoE experts, Muon-eligible
-    # SPEC: §9 Muon names "attention and expert matrices only"; dense-FFN matrices (baselines)
-    # are not named, so they stay on AdamW (with decay, as matrices).
-    (r"^layers\.\d+\.ffn\.w_(in|out)\.weight$", "decay"),            # dense FFN (baselines)
+    (r"^layers\.\d+\.ffn\.w_(in|out)\.weight$", "decay_matrix"),     # dense FFN (baselines), Muon-eligible
     (r"^layers\.\d+\.ffn\.router_weight$", "decay"),
     (r"^layers\.\d+\.ffn\.router_bias$", "no_decay"),
     (r"^(emb_norm|final_norm|layers\.\d+\.(attn_norm|ffn_norm))\.weight$", "no_decay"),

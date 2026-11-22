@@ -53,7 +53,7 @@ loss:
   bias_update_speed: 0.001
   loss_chunk_tokens: 512
 train:
-  total_tokens: 1.2288e6   # 300 steps of 4,096 tokens
+  total_tokens: 1.2288e6   # nominally 300 steps of >= 4,096 tokens (the run stops on tokens)
   tokens_per_step: 4096
   mb_tokens: 2048
   grad_ckpt: layer

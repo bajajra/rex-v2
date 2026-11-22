@@ -70,8 +70,8 @@ def main(argv=None) -> int:
             tr.load(ck)
             print(f"[train] resumed from {ck} at step {tr.step}", flush=True)
     n_body = sum(p.numel() for n, p in model.named_parameters() if n not in ("emb.weight", "lm_head.weight"))
-    print(f"[train] {cfg.name}: body params {n_body:,}; {tr.n_steps} steps of {cfg.train.tokens_per_step:,} "
-          f"tokens; device {args.device}; precision {cfg.train.precision}", flush=True)
+    print(f"[train] {cfg.name}: body params {n_body:,}; {cfg.train.total_tokens:,.0f} tokens (nominally {tr.n_steps} steps "
+          f"of >= {cfg.train.tokens_per_step:,}); device {args.device}; precision {cfg.train.precision}", flush=True)
     tr.fit()
     return 0
 

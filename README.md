@@ -86,8 +86,8 @@ python scripts/make_standin.py --out runs/standin            # tokenizer + main/
 python scripts/train.py --config configs/tiny-cpu.yaml --out runs/tiny-cpu \
     --log-every 25 --eval-every 75 --eval-batches 4 --ckpt-every 75 --max-steps 150
 python scripts/train.py --config configs/tiny-cpu.yaml --out runs/tiny-cpu \
-    --log-every 25 --eval-every 75 --eval-batches 4 --ckpt-every 75 --resume   # finishes 300 steps
-python scripts/eval.py --ckpt runs/tiny-cpu/checkpoints/step_0000300.pt --long-max-len 2048 \
+    --log-every 25 --eval-every 75 --eval-batches 4 --ckpt-every 75 --resume   # runs until total_tokens are consumed
+python scripts/eval.py --ckpt runs/tiny-cpu/checkpoints/$(cat runs/tiny-cpu/checkpoints/latest) --long-max-len 2048 \
     --contexts 64 512 all --target-len 128 --gaps 128 512 --passage-len 128
 ```
 
@@ -104,7 +104,7 @@ python scripts/prep_data.py --preset pg19 --out /data/pg19                  # tr
 # a local tokenizer: --tokenizer /path/to/tokenizer.json [--tokenizer-sha256 <pin>]
 ```
 
-2. Smoke tier (§13: base model, 50M tokens, 190 steps, warm-up 20, stage 1 only), then the full run:
+2. Smoke tier (§13: base model, 50M tokens (nominally 190 steps), warm-up 20, stage 1 only), then the full run:
 
 ```bash
 pip install flash-attn --no-build-isolation
@@ -124,4 +124,7 @@ python scripts/bench.py --config configs/rex-v2-base.yaml --seq-len 65536 --set 
 ```
 
 `--set` takes any config key (`section.key=value`, YAML-parsed). A sequence longer than
-`mb_tokens` forms a micro-batch of its own.
+`mb_tokens` forms a micro-batch of its own. Tokens are the clock (§6.5, §9): each step holds at
+least `tokens_per_step` tokens, the run stops at the first step boundary past `total_tokens`, and
+the LR cosine and curriculum stage follow the tokens consumed before each step; the step count
+`floor(total_tokens / tokens_per_step)` is nominal.

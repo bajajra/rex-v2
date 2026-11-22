@@ -1,8 +1,8 @@
 """Token-budget batches of whole documents and crops, with the length curriculum (§6.5).
 
-* A step holds whole sequences drawn until the next one would exceed ``tokens_per_step``; that
-  sequence is carried over to the next step, so a step's token count is within one sequence of
-  the budget (T24). A step is never empty: a lone sequence larger than the budget forms a step.
+* A step draws whole sequences until its token count reaches or exceeds ``tokens_per_step``;
+  the last one may overshoot and nothing is carried forward, so a step holds at least
+  ``tokens_per_step`` and fewer than ``tokens_per_step + max_len`` tokens (§6.5, T24).
 * Every sequence is ``[bos] + document tokens (+ [eot])``; a document longer than the stage
   ``max_len`` contributes one random contiguous crop, and ``eot`` is present only when the
   sequence contains the document's true end.
@@ -129,8 +129,7 @@ def crop_spec(corpus_id: int, doc: int, doc_len: int, max_len: int, rng: np.rand
 def pack_micro(lengths: Sequence[int], mb_tokens: int) -> List[List[int]]:
     """First-fit decreasing; returns lists of indices. A sequence longer than ``mb_tokens`` gets
     a micro-batch of its own (sequences are never split, §5.1)."""
-    # SPEC: §2 sets mb_tokens 65,536 but stage 3 sequences reach 262,144; §5.7 says "At 262k a
-    # micro-batch is one document". Reading taken: an over-budget sequence forms its own micro-batch.
+    # §6.5: mb_tokens is a packing budget; a longer sequence forms a micro-batch of its own.
     order = sorted(range(len(lengths)), key=lambda i: (-lengths[i], i))
     bins: List[List[int]] = []
     room: List[int] = []
@@ -170,19 +169,17 @@ class CurriculumLoader:
         self.cursor = [0, 0]
         self.stage_tokens = [0, 0]       # tokens drawn per source within the current stage
         self.stage = -1
-        self.carry: Optional[SeqSpec] = None
         self._perm_cache: Dict[Tuple[int, int], np.ndarray] = {}
 
     # ------------------------------------------------------------------ state
     def state_dict(self) -> dict:
         return {"epoch": list(self.epoch), "cursor": list(self.cursor), "stage_tokens": list(self.stage_tokens),
-                "stage": self.stage, "carry": None if self.carry is None else self.carry.to_list(),
+                "stage": self.stage,
                 "seed": self.seed}
 
     def load_state_dict(self, s: dict) -> None:
         self.epoch, self.cursor = list(s["epoch"]), list(s["cursor"])
         self.stage_tokens, self.stage = list(s["stage_tokens"]), int(s["stage"])
-        self.carry = None if s["carry"] is None else SeqSpec.from_list(s["carry"])
         if int(s["seed"]) != self.seed:
             warnings.warn(f"loader seed changed on resume ({s['seed']} -> {self.seed}); keeping the saved seed")
             self.seed = int(s["seed"])
@@ -226,23 +223,15 @@ class CurriculumLoader:
         if si != self.stage:
             self.stage = si
             self.stage_tokens = [0, 0]
-            if self.carry is not None and self.carry.length > st.max_len:
-                self.carry = None  # drawn for the previous stage's max_len; re-crop is not defined
+        # §6.5: draw whole sequences until the step reaches or exceeds tokens_per_step; the last
+        # one may overshoot and nothing is carried forward.
         specs: List[SeqSpec] = []
         total = 0
-        while True:
-            if self.carry is not None:
-                s, self.carry = self.carry, None
-            else:
-                s = self._draw(self._choose_source(st.long_doc_frac), st.max_len)
-                self.stage_tokens[s.corpus] += s.length
-            if specs and total + s.length > self.tokens_per_step:
-                self.carry = s
-                break
+        while total < self.tokens_per_step:
+            s = self._draw(self._choose_source(st.long_doc_frac), st.max_len)
+            self.stage_tokens[s.corpus] += s.length
             specs.append(s)
             total += s.length
-            if total >= self.tokens_per_step:
-                break
         micro = [self.collate([specs[i] for i in idx]) for idx in pack_micro([s.length for s in specs], self.mb_tokens)]
         return StepBatch(micro, si, st.max_len, total, sum(m.n_targets for m in micro))
 

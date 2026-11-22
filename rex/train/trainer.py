@@ -30,7 +30,7 @@ from ..eval.metrics import (DeadExpertTracker, RoutingAccumulator, length_histog
 from ..model.model import next_token_targets
 from .losses import HeadStats, bits_per_byte, chunked_lm_backward
 from .optim import build_optimizer
-from .schedule import lr_at, total_steps
+from .schedule import lr_at, progress, total_steps
 
 PRECISIONS = ("bf16", "fp32")
 
@@ -93,8 +93,8 @@ class Trainer:
         self.attn_eval_batches = attn_eval_batches
         self.log_every, self.eval_every, self.ckpt_every = log_every, eval_every, ckpt_every
         self.keep_ckpts = keep_ckpts
-        self.n_steps = total_steps(self.t)
-        self.max_steps = self.n_steps if max_steps is None else min(max_steps, self.n_steps)
+        self.n_steps = total_steps(self.t)   # nominal, for planning/logging only (§9)
+        self.max_steps = max_steps            # optional early stop; the run ends on tokens (§6.5)
         self.opt = build_optimizer(self.model, self.t)
         self.step = 0
         self.tokens = 0
@@ -107,7 +107,7 @@ class Trainer:
         self.logger = JsonlLogger(self.out_dir / "metrics.jsonl" if self.out_dir else None, echo)
         self._win = self._new_window()
         if cfg.loss.balance == "bias" and cfg.loss.lb_coef != 1e-4:
-            warnings.warn("§5.7: balance: bias sets lb_coef to 1e-4; config has "
+            warnings.warn("§5.7: a balance: bias run must set lb_coef: 1e-4; config has "
                           f"lb_coef={cfg.loss.lb_coef} (not overridden)")
         self.hooks: List[Callable[[dict], None]] = []
 
@@ -120,8 +120,9 @@ class Trainer:
     def train_step(self) -> dict:
         model, t = self.model, self.t
         model.train()
-        sb = self.loader.next_step(self.tokens)
-        lr = lr_at(self.step, t, self.n_steps)
+        tokens_before = self.tokens
+        sb = self.loader.next_step(tokens_before)          # stage from tokens consumed before the step
+        lr = lr_at(self.step, tokens_before, t)             # LR from tokens consumed before the step
         for g in self.opt.param_groups:
             g["lr"] = lr
         self.opt.zero_grad(set_to_none=True)
@@ -167,7 +168,8 @@ class Trainer:
         w["gn_sum"] += gn
         w["aux"] += aux_total
         rec = {"step": self.step, "loss": head.ce_sum / max(head.n_targets, 1), "lr": lr, "grad_norm": gn,
-               "stage": sb.stage, "max_len": sb.max_len, "tokens": self.tokens, "n_micro": len(sb.micro)}
+               "stage": sb.stage, "max_len": sb.max_len, "tokens": self.tokens, "step_tokens": sb.n_tokens,
+               "progress": progress(tokens_before, t), "n_micro": len(sb.micro)}
         if log_now:
             self._log_window(rec, ratios)
         return rec
@@ -177,7 +179,7 @@ class Trainer:
         dt = max(time.time() - w["t0"], 1e-9)
         nats = w["head"].ce_sum / max(w["head"].n_targets, 1)
         out = {"kind": "train", "step": self.step, "stage": rec["stage"], "max_len": rec["max_len"],
-               "tokens": self.tokens, "loss": nats, "bpb": bits_per_byte(w["head"].ce_sum, w["bytes"]),
+               "tokens": self.tokens, "progress": rec["progress"], "loss": nats, "bpb": bits_per_byte(w["head"].ce_sum, w["bytes"]),
                "aux_loss": w["aux"] / max(w["steps"], 1), "lr": rec["lr"],
                "grad_norm": w["gn_sum"] / max(w["steps"], 1), "clip_frac": w["clipped"] / max(w["steps"], 1),
                "softcap_saturation": w["head"].n_saturated / max(w["head"].n_logits, 1),
@@ -211,8 +213,12 @@ class Trainer:
         return rec
 
     # ------------------------------------------------------------------ loop
+    def done(self) -> bool:
+        """§6.5: the run ends at the first step boundary where total_tokens have been consumed."""
+        return self.tokens >= self.t.total_tokens or (self.max_steps is not None and self.step >= self.max_steps)
+
     def fit(self) -> None:
-        while self.step < self.max_steps:
+        while not self.done():
             self.train_step()
             if self.eval_every and self.step % self.eval_every == 0:
                 self.run_eval()
@@ -239,7 +245,7 @@ class Trainer:
         self.step, self.tokens = int(s["step"]), int(s["tokens"])
         self.loader.load_state_dict(s["loader"])
         self.rng.bit_generator.state = s["rng"]["np"]
-        torch.set_rng_state(s["rng"]["torch"])
+        torch.set_rng_state(s["rng"]["torch"].to("cpu", torch.uint8))
         random.setstate(s["rng"]["python"])
         self.dead.load_state_dict(s["dead"])
 
@@ -260,7 +266,9 @@ class Trainer:
         return path
 
     def load(self, path: Path) -> None:
-        self.load_state_dict(torch.load(path, map_location=self.device, weights_only=False))
+        # Always map to CPU: torch.set_rng_state needs a CPU ByteTensor; model and optimizer
+        # state are copied onto the parameters' device by their load_state_dict.
+        self.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
 
 
 def latest_checkpoint(out_dir: str | Path) -> Optional[Path]:

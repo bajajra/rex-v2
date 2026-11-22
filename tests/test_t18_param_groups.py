@@ -16,7 +16,7 @@ NO_DECAY = re.compile(
 # §9 weight decay 0.1: Emb, attention, experts, router weight, output-gate weight (+ dense FFN).
 DECAY = re.compile(r"(^emb\.weight$|^lm_head\.weight$|\.attn\.w[qkvo]\.weight$|\.ffn\.w_(in|out)(\.weight)?$|"
                    r"\.ffn\.router_weight$|\.attn\.gate\.weight$)")
-MUON = re.compile(r"(\.attn\.w[qkvo]\.weight$|\.ffn\.w_(in|out)$)")
+MUON = re.compile(r"(\.attn\.w[qkvo]\.weight$|\.ffn\.w_(in|out)(\.weight)?$)")  # §9: + dense-FFN in baselines
 
 
 def _check(model, use_muon=False):

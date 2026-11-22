@@ -1,5 +1,8 @@
 """T24: curriculum loader. Every sequence starts with bos_id, never exceeds the stage max_len,
-eot_id appears only at true document ends, and the token budget per step is within one sequence.
+eot_id appears only at true document ends; every step holds at least tokens_per_step and fewer
+than tokens_per_step + max_len tokens; no sequence is split across micro-batches; a run consumes
+at least total_tokens and less than total_tokens + tokens_per_step + max_len; the §9 schedule
+returns lr_min_ratio·peak at p = 1 and peak·(step+1)/warmup_steps at p = 0 during warm-up.
 
 Uses SYNTHETIC corpora (token ids are document-tagged counters, not text), written in the
 prepared-shard format of rex/data/prep.py.
@@ -53,22 +56,23 @@ def test_t24_curriculum_loader(corpora):
     tokens = 0
     stages_seen = set()
     src_tokens = {}
+    drawn = []
     while tokens < ld.total_tokens:
         sb = ld.next_step(tokens)
         stage = CURR[sb.stage]
         stages_seen.add(sb.stage)
         assert sb.stage == ld.stage_index(tokens)
         assert sb.max_len == stage.max_len
-        # token budget per step within one sequence
-        assert abs(sb.n_tokens - budget) <= stage.max_len
-        if ld.carry is not None:
-            assert budget - sb.n_tokens < ld.carry.length
+        # §6.5: at least the budget, overshoot by less than one sequence (< max_len)
+        assert budget <= sb.n_tokens < budget + stage.max_len
         assert sb.n_tokens == sum(m.n_tokens for m in sb.micro)
         for mb in sb.micro:
             seqs = _sequences(mb)
             assert mb.n_tokens <= ld.mb_tokens or len(seqs) == 1
             assert mb.n_targets == sum(len(s) - 1 for s in seqs)
             assert mb.pos.tolist() == [i for s in seqs for i in range(len(s))]
+            assert len(seqs) == len(mb.seq_lens) and [len(x) for x in seqs] == mb.seq_lens
+            drawn.extend(mb.seq_lens)
             for s, src in zip(seqs, mb.sources):
                 assert s[0] == BOS                                     # starts with bos
                 assert len(s) <= stage.max_len                         # never exceeds max_len
@@ -78,6 +82,9 @@ def test_t24_curriculum_loader(corpora):
                 src_tokens.setdefault(sb.stage, [0, 0])[src] += len(s)
         tokens += sb.n_tokens
     assert stages_seen == {0, 1, 2}
+    # run-level token budget (T24)
+    assert ld.total_tokens <= tokens < ld.total_tokens + budget + CURR[-1].max_len
+    assert sum(drawn) == tokens
     # long-document share of tokens per stage (deficit rule: within one long sequence of target)
     for si, (m, l) in src_tokens.items():
         assert abs(l / (m + l) - CURR[si].long_doc_frac) < 0.12, (si, m, l)
@@ -157,8 +164,26 @@ def test_t24_base_config_budget(tmp_path):
         for _ in range(2):
             sb = ld.next_step(tokens)
             st = t.curriculum[sb.stage]
-            assert abs(sb.n_tokens - t.tokens_per_step) <= st.max_len
+            assert t.tokens_per_step <= sb.n_tokens < t.tokens_per_step + st.max_len
+            assert sum(len(x) for mb in sb.micro for x in _sequences(mb)) == sb.n_tokens
             for mb in sb.micro:
                 for s in _sequences(mb):
                     assert s[0] == m.bos_id and len(s) <= st.max_len
                     assert (s == m.eot_id).sum() <= 1 and ((s == m.eot_id).sum() == 0 or s[-1] == m.eot_id)
+
+
+def test_t24_schedule_endpoints():
+    """§9 / T24: lr_min_ratio·peak at p = 1; peak·(step+1)/warmup_steps at p = 0 during warm-up."""
+    from rex.config import RexConfig
+    from rex.train.schedule import lr_at
+
+    t = RexConfig().train
+    for step in (0, 1, 499, 998):
+        assert lr_at(step, 0, t) == pytest.approx(t.lr * (step + 1) / t.warmup_steps, rel=1e-12)
+    assert lr_at(t.warmup_steps - 1, 0, t) == pytest.approx(t.lr, rel=1e-12)
+    assert lr_at(20000, t.total_tokens, t) == pytest.approx(t.lr * t.lr_min_ratio, rel=1e-12)
+    assert lr_at(20000, 2 * t.total_tokens, t) == pytest.approx(t.lr * t.lr_min_ratio, rel=1e-12)  # p capped at 1
+    lo, peak = t.lr * t.lr_min_ratio, t.lr
+    assert lr_at(5000, t.total_tokens / 2, t) == pytest.approx(lo + 0.5 * (peak - lo), rel=1e-12)
+    # warm-up factor multiplies the cosine of token progress
+    assert lr_at(9, t.total_tokens / 2, t) == pytest.approx((10 / t.warmup_steps) * (lo + 0.5 * (peak - lo)))
