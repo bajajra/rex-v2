@@ -1,0 +1,77 @@
+# CPU smoke harness, NOT a spec tier: the §14 "tiny" model trained on the SYNTHETIC STAND-IN
+# tokenizer/corpus built by scripts/make_standin.py (local Python stdlib sources, 500-id BPE).
+# Exercises the full pipeline (curriculum with 3 stages, micro-batch accumulation, chunked head,
+# checkpointing, aux losses, logging, eval) in a few minutes on CPU. Numbers it produces say
+# nothing about rex-v2 quality.
+name: tiny-cpu
+model:
+  vocab_size: 512
+  unpadded_vocab_size: 500
+  bos_id: 498
+  eot_id: 499
+  tie_embeddings: true
+  d_model: 64
+  n_layers: 8
+  block_size: 2
+  core_start: 2
+  core_end: 6
+  n_passes: 3
+  residual: attnres
+  gate_rank: 4
+  rms_eps: 1.0e-6
+  attn:
+    head_dim: 32
+    n_q_heads: 2
+    n_kv_heads: 1
+    window: 8
+    global_layers: [1, 3, 5, 7]
+    local_pos: rope
+    rope_base: 10000.0
+    global_pos: none
+    global_rope_base: 1.0e6
+    qk_mode: norm
+    qk_scale_init: 1.44
+    log_scale_alpha: 0.1
+    log_scale_n_floor: 8192
+    out_gate: true
+    backend: reference
+  ffn:
+    type: moe
+    n_experts: 6
+    top_k: 2
+    expert_hidden: 16
+    route_scale: 8.0
+    router_bias: true
+    dense_hidden: 32
+    dispatch: sorted
+  final_logit_softcap: 30.0
+loss:
+  lb_coef: 0.01
+  lb_load_ema: 0.9
+  z_coef: 0.001
+  balance: aux
+  bias_update_speed: 0.001
+  loss_chunk_tokens: 512
+train:
+  total_tokens: 1.2288e6   # 300 steps of 4,096 tokens
+  tokens_per_step: 4096
+  mb_tokens: 2048
+  grad_ckpt: layer
+  tok_chunk: null
+  optimizer: adamw
+  lr: 3.0e-3
+  lr_min_ratio: 0.1
+  warmup_steps: 20
+  betas: [0.9, 0.95]
+  adam_eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+  precision: fp32          # not a spec value: CPU fallback (bf16 autocast also runs on CPU, slower)
+  pass_sampling: fixed
+  curriculum:
+    - {until: 0.60, max_len: 256,  long_doc_frac: 0.15}
+    - {until: 0.85, max_len: 1024, long_doc_frac: 0.50}
+    - {until: 1.00, max_len: 2048, long_doc_frac: 0.70}
+data:
+  main: runs/standin/main
+  long_docs: runs/standin/long

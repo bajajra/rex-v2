@@ -10,10 +10,14 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
     "pyyaml>=6.0",
+    "numpy>=1.24",
+    "tokenizers>=0.15",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pyarrow>=14"]
+# data prep from the hub / parquet files
+data = ["huggingface_hub>=0.20", "pyarrow>=14"]
 # GPU fast path (CUDA only, optional): pip install flash-attn --no-build-isolation
 flash = ["flash-attn>=2.5"]
 

@@ -1,5 +1,5 @@
 # Smoke tier (§8: "Tiers: smoke 50M"): rex-v2-base with total_tokens 5e7.
-# SPEC: §13 names smoke.yaml but does not define it; only total_tokens differs from the base.
+# §13: base model; train.total_tokens 5.0e7 (190 steps); warmup_steps 20; single stage-1 curriculum entry.
 name: rex-v2-smoke
 model:
   vocab_size: 201024
@@ -58,17 +58,15 @@ train:
   optimizer: adamw        # adamw | muon (ablation)
   lr: 4.0e-4
   lr_min_ratio: 0.1
-  warmup_steps: 1000
+  warmup_steps: 20        # §13 smoke ruling
   betas: [0.9, 0.95]
   adam_eps: 1.0e-8
   weight_decay: 0.1
   grad_clip: 1.0
   precision: bf16
   pass_sampling: fixed    # fixed | uniform (ablation: T ~ U{1..n_passes} per micro-batch)
-  curriculum:             # fractions of total_tokens; see §6.5
-    - {until: 0.82, max_len: 8192,   long_doc_frac: 0.15}
-    - {until: 0.94, max_len: 65536,  long_doc_frac: 0.50}
-    - {until: 1.00, max_len: 262144, long_doc_frac: 0.70}
+  curriculum:             # §13 smoke ruling: stage 1 only
+    - {until: 1.00, max_len: 8192,   long_doc_frac: 0.15}
 data:
   main: HuggingFaceFW/fineweb-edu (sample-10BT)
   long_docs: deepmind/pg19

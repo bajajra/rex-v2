@@ -5,3 +5,11 @@ build/
 dist/
 .pytest_cache/
 .venv/
+
+# run outputs, prepared data, checkpoints, caches (keep them out of the repo)
+/runs/
+/data/
+/prepped/
+*.pt
+*.bin
+*.npy
