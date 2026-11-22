@@ -28,7 +28,7 @@ rex-v2 is Inkling 2 Mini's text decoder topology at one quarter of the width: 24
 | Total, tied (default) | 313,645,632 |
 | Total if untied | 429,435,456 (untying costs +115,789,824) |
 | Body parameters a token touches once (stored-active) | 78,416,448 |
-| Body parameters weighted by applications (effective-active) | 156,654,912 |
+| Body parameters weighted by applications (effective-active, weight matrices only) | 156,653,568 |
 | Layer applications per token | 48 (40 sliding-window, 8 full-attention) |
 
 ### Position on "MoE spends parameters to save compute, looping spends compute to save parameters"
@@ -193,7 +193,7 @@ Per stored layer: attention matrices 1,179,648; MoE 6,983,452 (router 16,156 + e
 
 Depth reader count is 56 (31 attention + 24 MoE + 1 output), which equals the count Goodfire reports for Inkling. That report does not explain 31; the reading used here, 23 + 4·2 (no reader for layer 0's attention, which has a single source, and separate Q/K/V readers in the four full-attention layers), is my inference **[I?]**.
 
-Active-parameter accounting: inactive experts are L·(E−k)·3dh = 119,439,360, so stored-active body = 78,416,448. Effective-active (each application counted, matmul weights only) = 156,654,912.
+Active-parameter accounting: inactive experts are L·(E−k)·3dh = 119,439,360, so stored-active body = 78,416,448. Effective-active = 156,653,568, defined as weight matrices only, each counted once per application: per application the attention matrices (1,179,648), the output-gate weight (3,456), the router weight (16,128) and the 8 selected experts (1,990,656), times 48 applications, plus `P`, `F`, `G` of the four gates (147,456) for each of the 24 gated applications. All vectors are excluded: router bias, output-gate bias, gains, QK scales, depth and cross-pass queries. (Revision 2 printed 156,654,912, which wrongly included the router bias.)
 
 ---
 
@@ -262,7 +262,7 @@ Source lists **[I][K]**:
 
 All queries `q` are initialised to zero, giving a uniform average over sources at step 0. The Kimi paper states this is required: "all pseudo-query vectors must be initialized to zero ... prevents training volatility" (https://arxiv.org/abs/2603.15031 §5).
 
-Consequence used as an acceptance test: multiplying every output projection inside one block by a positive constant leaves the model's logits unchanged.
+Consequence used as an acceptance test: multiplying every output projection inside one block by a positive constant leaves the model's logits unchanged. The invariance is exact only as `rms_eps` -> 0; with eps > 0 a source of mean square m is perturbed by a relative amount of order eps/m, and top-k routing can turn that into a discrete change. At default init the block-sum RMS is about 0.1-0.3 in the base config (eps/m ≤ 1e-4) and about 0.025 in the tiny test config (eps/m ≈ 1.6e-3). Neither is an init-scale problem, because values and keys are normalised and only eps/m matters; `rms_eps` stays 1e-6 [I] and no init is rescaled for small configs.
 
 ### 5.4 Layer schedule and forward pass
 
@@ -402,7 +402,7 @@ loss    = L_CE + lb_coef · Σ_layers L_LB + z_coef · Σ_layers L_Z
 ```
 
 - Form and coefficients are Switch/OLMoE **[S]** (https://arxiv.org/abs/2101.03961; OLMoE §4.1.6-7: 0.01 and 0.001; without the balance loss OLMoE's first layer collapsed onto one expert).
-- The smoothed load `f̃` is **[J]**, motivated by Qiu et al.: when a micro-batch is close to one sequence, the standard loss forces uniform routing within that sequence and suppresses specialisation (https://arxiv.org/abs/2501.11873). At 262k a micro-batch is one document. ρ = 0 recovers the standard loss.
+- The smoothed load `f̃` is **[J]**, motivated by Qiu et al.: when a micro-batch is close to one sequence, the standard loss forces uniform routing within that sequence and suppresses specialisation (https://arxiv.org/abs/2501.11873). At 262k a micro-batch is one document. ρ = 0 recovers the standard loss. The buffer `f̃` is written exactly once per training-mode forward of a micro-batch (never by a checkpoint recomputation); in eval mode the loss is computed from the same formula but the buffer is left untouched, so evaluation never changes training state.
 - `balance: bias` (ablation, DeepSeek-V3/V4.1 **[D]**; https://arxiv.org/abs/2412.19437 §2.1.2): a non-learned buffer `c ∈ R^E` per layer is added to `logits` for the top-k selection only; after each optimiser step `c_i += bias_update_speed · sign(1/E − f_step[i])`; `lb_coef` is set to 1e-4.
 
 Dead experts: an expert is dead if its load over an evaluation window is below 0.1/E. No revival mechanism is built. With 8 of 28 selected, death is unlikely; if any expert stays dead for 2,000 steps after warm-up, the run is restarted with `lb_coef: 0.03`, and if that fails with `balance: bias`.
@@ -439,7 +439,7 @@ The head must be evaluated in chunks: 65,536 tokens x 200,058 logits is 52 GB in
 | Parameter | Init | Tag |
 |---|---|---|
 | `Emb` | N(0, 0.02²) | [S] |
-| All attention and expert matrices, including `W_O`, `W_out` | truncated normal, std 0.02, cut at ±0.06 | [S] (OLMoE §4.2.2) |
+| All attention and expert matrices, including `W_O`, `W_out`; dense-FFN `W_in`, `W_out` in the baselines | truncated normal, std 0.02, cut at ±0.06 | [S] (OLMoE §4.2.2) |
 | Router `W_r` / `b_r` | N(0, 0.02²) / 0 | [S] |
 | RMSNorm gains | 1 | [S] |
 | Depth queries `q` | 0 | [K] |
@@ -554,7 +554,7 @@ Decision: **head_dim 128, 6 query heads, 2 KV heads, attention inner width 768 >
 - Decoupling heads x head_dim from d (768 vs 576) is what Inkling does (3,072 vs 2,304) and costs 1.18 M parameters per layer, 14% of the body.
 - GQA at 3:1 is kept because the K/V of full-attention layers are now a real cost: 2.15 GB of cache at 262k with 2 KV heads, 6.4 GB with 6.
 
-The cost is fewer distinct heads (6 per layer). Ablation 8 compares 12 x 64 with 4 KV heads at identical parameter count.
+The cost is fewer distinct heads (6 per layer). Ablation 8 compares 12 x 64 with 4 KV heads: the four projection matrices are identical in size, and the per-head QK scales and output gates add 83,232 parameters (body 197,939,040, still under the cap).
 
 ---
 
@@ -637,7 +637,7 @@ Attention residuals are working if:
 | Metric | Definition |
 |---|---|
 | α maps (eval) | mean depth-mix weights per reader; should depart from uniform and favour recent sources with persistent weight on v0 (Kimi Fig. 8; Goodfire Fig. 4) |
-| Block-sum RMS | RMS of V1..V4 and of running sums; unbounded growth is harmless to the forward pass but signals a scale race |
+| Block-sum RMS | RMS of V1..V4 and of running sums; unbounded growth is harmless to the forward pass but signals a scale race; a value below 0.01 (mean square within 100x of eps) means eps is distorting the mix |
 
 Long context is working if:
 
@@ -667,13 +667,15 @@ All share the tokenizer, data, curriculum and recipe. Counts are exact body para
 
 `residual: stream` is the ordinary pre-norm stream: `x = RMSNorm_emb(Emb[ids])`; `x += Attention(RMSNorm(x))`; `x += FFN(RMSNorm(x))`; `hfinal = RMSNorm_f(x)`; attention and FFN modules unchanged.
 
+B0's initial loss is higher than the others' (12.73, reproduced; the base model's 12.30 and the 11.5 and 12.34 below are as reported by the stage-1 implementation). With a plain stream and tied embeddings the final state at initialisation is still dominated by the token's own embedding, so the logit of the input token itself averages about 11.5 and takes roughly 30% of the probability mass; with that one logit removed the loss is 12.34. Attention residuals dilute the embedding to one source in five, which is why the other configs do not show it. This is a transient of the first few dozen steps. B0's initialisation is deliberately left unchanged so that it remains a standard-init anchor.
+
 Every comparison is reported twice: at equal training tokens and at equal training FLOPs (evaluate checkpoints at matched cumulative FLOPs). B2 is the configuration behind the claim that a dense looped model wins at equal data; B1 tests whether the experts earn their parameters.
 
 ---
 
 ## 12. Ablation plan (ordered)
 
-Each run uses the 600M-token tier with stage-1 settings unless stated. An MoE's advantage can appear late because experts train on a fraction of tokens, so any conclusion that decides the final architecture is re-checked at 6B.
+Each run uses the 600M-token tier (2,289 steps) with stage-1 settings and `warmup_steps: 200` unless stated; run 0 uses `smoke.yaml` (§13). An MoE's advantage can appear late because experts train on a fraction of tokens, so any conclusion that decides the final architecture is re-checked at 6B.
 
 | # | Question | Runs |
 |---|---|---|
@@ -685,7 +687,7 @@ Each run uses the 600M-token tier with stage-1 settings unless stated. An MoE's 
 | 5 | Cross-pass machinery | four readers (default) vs one reader and gate shared by Q, K, V, M per layer vs γ fixed at 0 |
 | 6 | Optimiser | Muon vs AdamW |
 | 7 | MoE shape and balancing | 14 experts / top-4 / hidden 288 (body 197,661,936); `balance: bias`; `lb_load_ema: 0` |
-| 8 | Attention | `qk_mode: l2clip`; 12 x 64 query heads with 4 KV heads; window 256; `n_kv_heads: 6` |
+| 8 | Attention | `qk_mode: l2clip`; 12 x 64 query heads with 4 KV heads (+83,232 parameters); window 256; `n_kv_heads: 6` |
 | 9 | Long context (needs stages 2-3, 1.2B tokens) | curriculum vs stage 1 only, both evaluated at 65k and 262k; `global_pos: rope`; `log_scale_alpha: 0` |
 | 10 | Variable passes | `pass_sampling: uniform`, evaluated at T = 1, 2, 3 |
 
@@ -697,6 +699,8 @@ Each run uses the 600M-token tier with stage-1 settings unless stated. An MoE's 
 rex-v2/
   docs/DESIGN.md
   configs/            rex-v2-base.yaml, a1.yaml, b0.yaml, b1.yaml, b2.yaml, b3.yaml, smoke.yaml
+                      # smoke.yaml = base model; train.total_tokens: 5.0e7 (190 steps); train.warmup_steps: 20;
+                      # train.curriculum: [{until: 1.00, max_len: 8192, long_doc_frac: 0.15}]
   rex/
     config.py         dataclasses, validation (e.g. stream requires n_passes == 1)
     model/
@@ -730,16 +734,16 @@ rex-v2/
 
 ## 14. Acceptance tests
 
-Tolerances: 1e-5 relative in float64 on the reference backend unless stated. "Tiny" = d 64, 8 layers in blocks of 2 (core 2..5), 2 query / 1 KV heads x 32, 6 experts top-2 hidden 16, rank 4, window 8, vocabulary 512.
+Tolerances: 1e-5 relative in float64 on the reference backend unless stated. "Tiny" = d 64, 8 layers in blocks of 2 (core 2..5), full-attention layers [1, 3, 5, 7], 2 query / 1 KV heads x 32, 6 experts top-2 hidden 16, rank 4, window 8, vocabulary 512 with 500 unpadded ids.
 
 | # | Test | Pass condition |
 |---|---|---|
 | T1 | Parameter count | base config: body = 197,855,808 and embedding = 115,789,824, each row of §3 individually; A1, B0-B3 match §11; `count_params.py` agrees with the instantiated model |
-| T2 | Initial loss | on random ids, loss within [12.1, 12.6] for the base config |
+| T2 | Initial loss | on random ids, cross-entropy `L_CE` within [12.1, 12.6] for the base config |
 | T3 | Loop identity at init | with default init, logits for T = 1, 2, 3 are equal, and V2[t], V3[t] are equal for all t |
 | T4 | Loop is live | after setting F, G to random values, logits for T = 1 and T = 3 differ; with γ forced to 0 and κ to 1 they are equal again |
 | T5 | DepthMix | with q = 0 the weights are exactly 1/n; weights sum to 1; output is unchanged when any source is multiplied by a positive scalar |
-| T6 | Block-scale invariance | multiplying all `W_O` and expert `W_out` of one block by 3.0 leaves logits unchanged (tolerance 1e-4 in float32) |
+| T6 | Block-scale invariance | tiny model at default init, float64, with `rms_eps: 1e-12` for this test only: multiplying all `W_O` and expert `W_out` of one block by 3.0 leaves logits unchanged within 1e-8, for a prelude, a core and the coda block. No weight rescaling in the test. The base config at default eps is not asserted (see §5.3) |
 | T7 | Source lists | a hook records the sources of every reader in every pass; they equal the table in §5.3; reader count is 56 for the base config |
 | T8 | Causality | changing token j changes no logit at positions < j, for every pass |
 | T9 | Window | in a single windowed attention module, the output at i is unchanged by tokens at positions ≤ i − window |
@@ -753,9 +757,9 @@ Tolerances: 1e-5 relative in float64 on the reference backend unless stated. "Ti
 | T17 | Chunked head | loss and all gradients equal the unchunked computation; padded rows of `Emb` have zero gradient |
 | T18 | Parameter groups | every parameter is in exactly one group; the no-decay list matches §9 |
 | T19 | Gradient reach | after 2 optimiser steps on the tiny model every parameter except padded embedding rows has a non-zero gradient (at step 0 only `P` and `u` may be zero) |
-| T20 | Overfit | tiny model reaches loss < 0.05 on one fixed batch of 4 sequences x 64 tokens within 500 steps, with auxiliary losses on |
+| T20 | Overfit | tiny model reaches cross-entropy `L_CE` < 0.05 on one fixed batch of 4 sequences x 64 tokens within 500 steps, optimising the full loss with auxiliary losses on. The threshold is on `L_CE` alone: the auxiliary term has a floor of about `lb_coef` x (number of MoE layers), 0.08 in the tiny model and 0.24 in the base model |
 | T21 | Incremental decoding | token-by-token generation with per-application caches reproduces the full-sequence logits |
-| T22 | Baselines | B0 with `residual: stream` runs T2, T8, T20; config validation rejects stream with `n_passes` > 1 |
+| T22 | Baselines | B0 with `residual: stream` runs T8 and T20, and T2 with two bands: `L_CE` within [12.1, 13.0] as is, and within [12.1, 12.6] when each position's logit for its own input token id is excluded from the softmax (§11 explains the difference); config validation rejects stream with `n_passes` > 1 |
 | T23 | Long sequence (GPU) | one forward and backward at the stage-3 `max_len` completes within memory on the target card, and the flash backend accepts that length |
 | T24 | Curriculum loader | every sequence starts with `bos_id`, never exceeds the stage `max_len`, `eot_id` only at true document ends, token budget per step within one sequence of 262,144 |
 
