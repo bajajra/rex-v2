@@ -1,0 +1,72 @@
+name: rex-v2-base
+model:
+  vocab_size: 201024
+  unpadded_vocab_size: 200058
+  bos_id: 200028          # <|begin_of_text|>
+  eot_id: 199999          # <|endoftext|>
+  tie_embeddings: true
+  d_model: 576
+  n_layers: 24
+  block_size: 6           # layers per AttnRes block
+  core_start: 6           # first looped layer (inclusive)
+  core_end: 18            # last looped layer (exclusive)
+  n_passes: 3
+  residual: attnres       # attnres | stream (stream only for baseline B0, requires n_passes: 1)
+  gate_rank: 16
+  rms_eps: 1.0e-6
+  attn:
+    head_dim: 128
+    n_q_heads: 6
+    n_kv_heads: 2
+    window: 1024
+    global_layers: [5, 11, 17, 23]
+    local_pos: rope
+    rope_base: 10000.0
+    global_pos: none      # none | rope (ablation; rope uses global_rope_base)
+    global_rope_base: 1.0e6
+    qk_mode: norm         # norm | l2clip (ablation; clip threshold 2*sqrt(head_dim))
+    qk_scale_init: 1.44
+    log_scale_alpha: 0.1
+    log_scale_n_floor: 8192
+    out_gate: true
+    backend: flash        # flash | reference
+  ffn:
+    type: moe             # moe | dense
+    n_experts: 28
+    top_k: 8
+    expert_hidden: 144
+    route_scale: 8.0
+    router_bias: true
+    dense_hidden: 1152    # used only when type: dense
+    dispatch: sorted      # sorted | dense_ref (tests only)
+  final_logit_softcap: 30.0
+loss:
+  lb_coef: 0.01
+  lb_load_ema: 0.9
+  z_coef: 0.001
+  balance: aux            # aux | bias (ablation)
+  bias_update_speed: 0.001
+  loss_chunk_tokens: 2048
+train:
+  total_tokens: 6.0e9
+  tokens_per_step: 262144
+  mb_tokens: 65536        # micro-batch token budget; lower it to fit memory
+  grad_ckpt: layer        # none | layer
+  tok_chunk: null         # e.g. 32768: nested checkpoint of token-local parts for very long sequences
+  optimizer: adamw        # adamw | muon (ablation)
+  lr: 4.0e-4
+  lr_min_ratio: 0.1
+  warmup_steps: 1000
+  betas: [0.9, 0.95]
+  adam_eps: 1.0e-8
+  weight_decay: 0.1
+  grad_clip: 1.0
+  precision: bf16
+  pass_sampling: fixed    # fixed | uniform (ablation: T ~ U{1..n_passes} per micro-batch)
+  curriculum:             # fractions of total_tokens; see §6.5
+    - {until: 0.82, max_len: 8192,   long_doc_frac: 0.15}
+    - {until: 0.94, max_len: 65536,  long_doc_frac: 0.50}
+    - {until: 1.00, max_len: 262144, long_doc_frac: 0.70}
+data:
+  main: HuggingFaceFW/fineweb-edu (sample-10BT)
+  long_docs: deepmind/pg19

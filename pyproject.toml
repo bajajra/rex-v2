@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rex-v2"
+version = "0.1.0"
+description = "rex-v2: a sub-200M-body looped MoE decoder with attention residuals (see docs/DESIGN.md)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+# GPU fast path (CUDA only, optional): pip install flash-attn --no-build-isolation
+flash = ["flash-attn>=2.5"]
+
+[tool.setuptools.packages.find]
+include = ["rex*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: instantiates a full-size model on CPU (seconds to minutes, ~1.5 GB RAM)",
+    "gpu: needs CUDA and flash-attn; skipped on CPU",
+]
