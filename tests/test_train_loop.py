@@ -114,12 +114,15 @@ def test_parse_overrides():
 
 
 def test_loss_falls_and_metrics_emit(corpora, tmp_path):
-    tr = _trainer(_cfg(), corpora, out_dir=tmp_path, log_every=10, eval_every=20, ckpt_every=20)
+    tr = _trainer(_cfg(total_tokens=1024 * 50), corpora, out_dir=tmp_path, log_every=10, eval_every=20,
+                  ckpt_every=20)
     tr.fit()
     recs = [json.loads(l) for l in open(tmp_path / "metrics.jsonl")]
     train = [r for r in recs if r["kind"] == "train"]
     evals = [r for r in recs if r["kind"] == "eval"]
-    assert len(train) == 4 and len(evals) == 2
+    # steps overshoot tokens_per_step, so the token-based run is shorter than the nominal 50 steps
+    assert 40 <= tr.step < 50
+    assert len(train) == tr.step // 10 and len(evals) == tr.step // 20
     assert train[0]["loss"] > train[-1]["loss"] + 1.0, [r["loss"] for r in train]
     assert {r["stage"] for r in train} == {0, 1, 2}
     for k in ("bpb", "grad_norm", "clip_frac", "softcap_saturation", "tok_s", "peak_mem_bytes", "seq_len_hist",
